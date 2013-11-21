@@ -30,6 +30,11 @@ ifeq ($(UNAME), MINGW32_NT-6.1)
 	CFLAGS += -march=pentium4
 	LDFLAGS += -Wl,--large-address-aware
 endif
+ifeq ($(UNAME), CYGWIN_NT-5.1)
+	#For windows make it large address aware, which allows the process to use more then 2GB of memory.
+	CFLAGS += -march=pentium4
+	LDFLAGS += -Wl,--large-address-aware -lm --static
+endif
 
 all: $(SOURCES) $(EXECUTABLE)
 
