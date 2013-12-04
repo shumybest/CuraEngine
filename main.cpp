@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <sys/time.h>
 #include <signal.h>
 #if defined(__linux__) || (defined(__APPLE__) && defined(__MACH__))
@@ -27,307 +26,12 @@
 #include "infill.h"
 #include "bridge.h"
 #include "support.h"
-#include "pathOptimizer.h"
+#include "pathOrderOptimizer.h"
 #include "skirt.h"
 #include "raft.h"
 #include "comb.h"
 #include "gcodeExport.h"
-
-#define FIX_HORRIBLE_UNION_ALL_TYPE_A    0x01
-#define FIX_HORRIBLE_UNION_ALL_TYPE_B    0x02
-#define FIX_HORRIBLE_EXTENSIVE_STITCHING 0x04
-#define FIX_HORRIBLE_KEEP_NONE_CLOSED    0x10
-
-#define VERSION "13.06.4"
-
-int verbose_level;
-int maxObjectHeight;
-
-void processFile(const char* input_filename, ConfigSettings& config, GCodeExport& gcode, bool firstFile)
-{
-    for(unsigned int n=1; n<16;n++)
-        gcode.setExtruderOffset(n, config.extruderOffset[n].p());
-    
-    double t = getTime();
-    log("Loading %s from disk...\n", input_filename);
-    SimpleModel* m = loadModel(input_filename, config.matrix);
-    if (!m)
-    {
-        log("Failed to load model: %s\n", input_filename);
-        return;
-    }
-    log("Loaded from disk in %5.3fs\n", timeElapsed(t));
-    log("Analyzing and optimizing model...\n");
-    OptimizedModel* om = new OptimizedModel(m, Point3(config.objectPosition.X, config.objectPosition.Y, -config.objectSink));
-    for(unsigned int v = 0; v < m->volumes.size(); v++)
-    {
-        log("  Face counts: %i -> %i %0.1f%%\n", (int)m->volumes[v].faces.size(), (int)om->volumes[v].faces.size(), float(om->volumes[v].faces.size()) / float(m->volumes[v].faces.size()) * 100);
-        log("  Vertex counts: %i -> %i %0.1f%%\n", (int)m->volumes[v].faces.size() * 3, (int)om->volumes[v].points.size(), float(om->volumes[v].points.size()) / float(m->volumes[v].faces.size() * 3) * 100);
-    }
-    delete m;
-    log("Optimize model %5.3fs \n", timeElapsed(t));
-    //om->saveDebugSTL("c:\\models\\output.stl");
-    
-    log("Slicing model...\n");
-    vector<Slicer*> slicerList;
-    for(unsigned int volumeIdx=0; volumeIdx < om->volumes.size(); volumeIdx++)
-    {
-        slicerList.push_back(new Slicer(&om->volumes[volumeIdx], config.initialLayerThickness / 2, config.layerThickness, config.fixHorrible & FIX_HORRIBLE_KEEP_NONE_CLOSED, config.fixHorrible & FIX_HORRIBLE_EXTENSIVE_STITCHING));
-        //slicerList[volumeIdx]->dumpSegments("C:\\models\\output.html");
-    }
-    log("Sliced model in %5.3fs\n", timeElapsed(t));
-
-    SliceDataStorage storage;
-    if (config.supportAngle > -1)
-    {
-        fprintf(stdout,"Generating support map...\n");
-        generateSupportGrid(storage.support, om);
-    }
-    storage.modelSize = om->modelSize;
-    storage.modelMin = om->vMin;
-    storage.modelMax = om->vMax;
-    delete om;
-    
-    log("Generating layer parts...\n");
-    for(unsigned int volumeIdx=0; volumeIdx < slicerList.size(); volumeIdx++)
-    {
-        storage.volumes.push_back(SliceVolumeStorage());
-        createLayerParts(storage.volumes[volumeIdx], slicerList[volumeIdx], config.fixHorrible & (FIX_HORRIBLE_UNION_ALL_TYPE_A | FIX_HORRIBLE_UNION_ALL_TYPE_B));
-        delete slicerList[volumeIdx];
-    }
-    //carveMultipleVolumes(storage.volumes);
-    generateMultipleVolumesOverlap(storage.volumes, config.multiVolumeOverlap);
-    log("Generated layer parts in %5.3fs\n", timeElapsed(t));
-    //dumpLayerparts(storage, "c:/models/output.html");
-    
-    const unsigned int totalLayers = storage.volumes[0].layers.size();
-    for(unsigned int layerNr=0; layerNr<totalLayers; layerNr++)
-    {
-        for(unsigned int volumeIdx=0; volumeIdx<storage.volumes.size(); volumeIdx++)
-        {
-            generateInsets(&storage.volumes[volumeIdx].layers[layerNr], config.extrusionWidth, config.insetCount);
-        }
-        logProgress("inset",layerNr+1,totalLayers);
-    }
-    log("Generated inset in %5.3fs\n", timeElapsed(t));
-    //dumpLayerparts(storage, "c:/models/output.html");
-
-    for(unsigned int layerNr=0; layerNr<totalLayers; layerNr++)
-    {
-        for(unsigned int volumeIdx=0; volumeIdx<storage.volumes.size(); volumeIdx++)
-        {
-            generateSkins(layerNr, storage.volumes[volumeIdx], config.extrusionWidth, config.downSkinCount, config.upSkinCount, config.infillOverlap);
-            generateSparse(layerNr, storage.volumes[volumeIdx], config.extrusionWidth, config.downSkinCount, config.upSkinCount);
-        }
-        logProgress("skin",layerNr+1,totalLayers);
-    }
-    log("Generated up/down skin in %5.3fs\n", timeElapsed(t));
-    generateSkirt(storage, config.skirtDistance, config.extrusionWidth, config.skirtLineCount);
-    generateRaft(storage, config.raftMargin);
-    
-    for(unsigned int volumeIdx=0; volumeIdx<storage.volumes.size(); volumeIdx++)
-    {
-        for(unsigned int layerNr=0; layerNr<totalLayers; layerNr++)
-        {
-            for(unsigned int partNr=0; partNr<storage.volumes[volumeIdx].layers[layerNr].parts.size(); partNr++)
-            {
-                if (layerNr > 0)
-                    storage.volumes[volumeIdx].layers[layerNr].parts[partNr].bridgeAngle = bridgeAngle(&storage.volumes[volumeIdx].layers[layerNr].parts[partNr], &storage.volumes[volumeIdx].layers[layerNr-1]);
-                else
-                    storage.volumes[volumeIdx].layers[layerNr].parts[partNr].bridgeAngle = -1;
-            }
-        }
-    }
-
-    gcode.setRetractionSettings(config.retractionAmount, config.retractionSpeed, config.retractionAmountExtruderSwitch);
-    if (firstFile)
-    {
-        gcode.addCode(config.startCode);
-    }else{
-        gcode.resetExtrusionValue();
-        gcode.addRetraction();
-        gcode.setZ(maxObjectHeight + 5000);
-        gcode.addMove(config.objectPosition.p(), config.moveSpeed, 0);
-    }
-    gcode.addComment("total_layers=%d",totalLayers);
-
-    GCodePathConfig skirtConfig(config.printSpeed, config.extrusionWidth, "SKIRT");
-    GCodePathConfig inset0Config(config.printSpeed, config.extrusionWidth, "WALL-OUTER");
-    GCodePathConfig inset1Config(config.printSpeed, config.extrusionWidth, "WALL-INNER");
-    GCodePathConfig fillConfig(config.infillSpeed, config.extrusionWidth, "FILL");
-    GCodePathConfig supportConfig(config.printSpeed, config.supportLineWidth, "SUPPORT");
-    
-    if (config.raftBaseThickness > 0 && config.raftInterfaceThickness > 0)
-    {
-        GCodePathConfig raftBaseConfig(config.initialLayerSpeed, config.raftBaseLinewidth, "SUPPORT");
-        GCodePathConfig raftInterfaceConfig(config.initialLayerSpeed, config.raftInterfaceLinewidth, "SUPPORT");
-        {
-            gcode.addComment("LAYER:-2");
-            gcode.addComment("RAFT");
-            GCodePlanner gcodeLayer(gcode, config.moveSpeed);
-            gcode.setZ(config.raftBaseThickness);
-            gcode.setExtrusion(config.raftBaseThickness, config.filamentDiameter, config.filamentFlow);
-            gcodeLayer.addPolygonsByOptimizer(storage.raftOutline, &raftBaseConfig);
-            
-            Polygons raftLines;
-            generateLineInfill(storage.raftOutline, raftLines, config.raftBaseLinewidth, config.raftLineSpacing, config.infillOverlap, 0);
-            gcodeLayer.addPolygonsByOptimizer(raftLines, &raftBaseConfig);
-            
-            gcodeLayer.writeGCode(false);
-        }
-
-        {
-            gcode.addComment("LAYER:-1");
-            gcode.addComment("RAFT");
-            GCodePlanner gcodeLayer(gcode, config.moveSpeed);
-            gcode.setZ(config.raftBaseThickness + config.raftInterfaceThickness);
-            gcode.setExtrusion(config.raftInterfaceThickness, config.filamentDiameter, config.filamentFlow);
-            
-            Polygons raftLines;
-            generateLineInfill(storage.raftOutline, raftLines, config.raftInterfaceLinewidth, config.raftLineSpacing, config.infillOverlap, 90);
-            gcodeLayer.addPolygonsByOptimizer(raftLines, &raftInterfaceConfig);
-            
-            gcodeLayer.writeGCode(false);
-        }
-    }
-
-    int volumeIdx = 0;
-    for(unsigned int layerNr=0; layerNr<totalLayers; layerNr++)
-    {
-        logProgress("export", layerNr+1, totalLayers);
-        
-        GCodePlanner gcodeLayer(gcode, config.moveSpeed);
-        gcode.addComment("LAYER:%d", layerNr);
-        int32_t z = config.initialLayerThickness + layerNr * config.layerThickness;
-        z += config.raftBaseThickness + config.raftInterfaceThickness;
-        gcode.setZ(z);
-        if (layerNr == 0)
-            gcodeLayer.addPolygonsByOptimizer(storage.skirt, &skirtConfig);
-        
-        for(unsigned int volumeCnt = 0; volumeCnt < storage.volumes.size(); volumeCnt++)
-        {
-            if (volumeCnt > 0)
-                volumeIdx = (volumeIdx + 1) % storage.volumes.size();
-            SliceLayer* layer = &storage.volumes[volumeIdx].layers[layerNr];
-            gcodeLayer.setExtruder(volumeIdx);
-            
-            PathOptimizer partOrderOptimizer(gcode.getPositionXY());
-            for(unsigned int partNr=0; partNr<layer->parts.size(); partNr++)
-            {
-                partOrderOptimizer.addPolygon(layer->parts[partNr].insets[0][0]);
-            }
-            partOrderOptimizer.optimize();
-            
-            for(unsigned int partCounter=0; partCounter<partOrderOptimizer.polyOrder.size(); partCounter++)
-            {
-                SliceLayerPart* part = &layer->parts[partOrderOptimizer.polyOrder[partCounter]];
-                
-                gcodeLayer.setCombBoundary(&part->combBoundery);
-                gcodeLayer.forceRetract();
-                if (config.insetCount > 0)
-                {
-                    for(int insetNr=part->insets.size()-1; insetNr>-1; insetNr--)
-                    {
-                        if (insetNr == 0)
-                            gcodeLayer.addPolygonsByOptimizer(part->insets[insetNr], &inset0Config);
-                        else
-                            gcodeLayer.addPolygonsByOptimizer(part->insets[insetNr], &inset1Config);
-                    }
-                }
-                
-                Polygons fillPolygons;
-                int fillAngle = 45;
-                if (layerNr & 1) fillAngle += 90;
-                //int sparseSteps[1] = {config.extrusionWidth};
-                //generateConcentricInfill(part->skinOutline, fillPolygons, sparseSteps, 1);
-                generateLineInfill(part->skinOutline, fillPolygons, config.extrusionWidth, config.extrusionWidth, config.infillOverlap, (part->bridgeAngle > -1) ? part->bridgeAngle : fillAngle);
-                //int sparseSteps[2] = {config.extrusionWidth*5, config.extrusionWidth * 0.8};
-                //generateConcentricInfill(part->sparseOutline, fillPolygons, sparseSteps, 2);
-                if (config.sparseInfillLineDistance > 0)
-                {
-                    if (config.sparseInfillLineDistance > config.extrusionWidth * 4)
-                    {
-                        generateLineInfill(part->sparseOutline, fillPolygons, config.extrusionWidth, config.sparseInfillLineDistance * 2, config.infillOverlap, 45);
-                        generateLineInfill(part->sparseOutline, fillPolygons, config.extrusionWidth, config.sparseInfillLineDistance * 2, config.infillOverlap, 45 + 90);
-                    }
-                    else
-                    {
-                        generateLineInfill(part->sparseOutline, fillPolygons, config.extrusionWidth, config.sparseInfillLineDistance, config.infillOverlap, fillAngle);
-                    }
-                }
-
-                gcodeLayer.addPolygonsByOptimizer(fillPolygons, &fillConfig);
-                
-                //After a layer part, make sure the nozzle is inside the comb boundary, so we do not retract on the perimeter.
-                gcodeLayer.moveInsideCombBoundary();
-            }
-            gcodeLayer.setCombBoundary(NULL);
-        }
-        if (config.supportAngle > -1)
-        {
-            SupportPolyGenerator supportGenerator(storage.support, z, config.supportAngle, config.supportEverywhere > 0, true);
-            gcodeLayer.addPolygonsByOptimizer(supportGenerator.polygons, &supportConfig);
-            if (layerNr == 0)
-            {
-                SupportPolyGenerator supportGenerator2(storage.support, z, config.supportAngle, config.supportEverywhere > 0, false);
-                gcodeLayer.addPolygonsByOptimizer(supportGenerator2.polygons, &supportConfig);
-            }
-        }
-
-        //Finish the layer by applying speed corrections for minimal layer times and slowdown for the initial layer.
-        if (int(layerNr) < config.initialSpeedupLayers)
-        {
-            int n = config.initialSpeedupLayers;
-            int layer0Factor = config.initialLayerSpeed * 100 / config.printSpeed;
-            gcodeLayer.setSpeedFactor((layer0Factor * (n - layerNr) + 100 * (layerNr)) / n);
-        }
-        gcodeLayer.forceMinimalLayerTime(config.minimalLayerTime, config.minimalFeedrate);
-        if (layerNr == 0)
-            gcode.setExtrusion(config.initialLayerThickness, config.filamentDiameter, config.filamentFlow);
-        else
-            gcode.setExtrusion(config.layerThickness, config.filamentDiameter, config.filamentFlow);
-        if (int(layerNr) >= config.fanOnLayerNr)
-        {
-            int speed = config.fanSpeedMin;
-            if (gcodeLayer.getSpeedFactor() <= 50)
-            {
-                speed = config.fanSpeedMax;
-            }else{
-                int n = gcodeLayer.getSpeedFactor() - 50;
-                speed = config.fanSpeedMin * n / 50 + config.fanSpeedMax * (50 - n) / 50;
-            }
-            gcode.addFanCommand(speed);
-        }else{
-            gcode.addFanCommand(0);
-        }
-        gcodeLayer.writeGCode(config.coolHeadLift > 0);
-    }
-
-    /* support debug
-    for(int32_t y=0; y<storage.support.gridHeight; y++)
-    {
-        for(int32_t x=0; x<storage.support.gridWidth; x++)
-        {
-            unsigned int n = x+y*storage.support.gridWidth;
-            if (storage.support.grid[n].size() < 1) continue;
-            int32_t z = storage.support.grid[n][0].z;
-            gcode.addMove(Point3(x * storage.support.gridScale + storage.support.gridOffset.X, y * storage.support.gridScale + storage.support.gridOffset.Y, 0), 0);
-            gcode.addMove(Point3(x * storage.support.gridScale + storage.support.gridOffset.X, y * storage.support.gridScale + storage.support.gridOffset.Y, z), z);
-            gcode.addMove(Point3(x * storage.support.gridScale + storage.support.gridOffset.X, y * storage.support.gridScale + storage.support.gridOffset.Y, 0), 0);
-        }
-    }
-    //*/
-    
-    log("Wrote layers in %5.2fs.\n", timeElapsed(t));
-    gcode.tellFileSize();
-    gcode.addFanCommand(0);
-
-    logProgress("process", 1, 1);
-    log("Total time elapsed %5.2fs.\n", timeElapsed(t,true));
-    
-    //Store the object height for when we are printing multiple objects, as we need to clear every one of them when moving to the next position.
-    maxObjectHeight = std::max(maxObjectHeight, storage.modelSize.z);
-}
+#include "fffProcessor.h"
 
 void print_usage()
 {
@@ -349,9 +53,8 @@ int main(int argc, char **argv)
 #endif
     signal(SIGFPE, signal_FPE);
 
-    GCodeExport gcode;
     ConfigSettings config;
-    int fileNr = 0;
+    fffProcessor processor(config);
 
     config.filamentDiameter = 2890;
     config.filamentFlow = 100;
@@ -366,9 +69,10 @@ int main(int argc, char **argv)
     config.printSpeed = 50;
     config.infillSpeed = 50;
     config.moveSpeed = 200;
-    config.fanOnLayerNr = 2;
+    config.fanFullOnLayerNr = 2;
     config.skirtDistance = 6000;
     config.skirtLineCount = 1;
+    config.skirtMinLength = 0;
     config.sparseInfillLineDistance = 100 * config.extrusionWidth / 20;
     config.infillOverlap = 15;
     config.objectPosition.X = 102500;
@@ -376,10 +80,18 @@ int main(int argc, char **argv)
     config.objectSink = 0;
     config.supportAngle = -1;
     config.supportEverywhere = 0;
-    config.supportLineWidth = config.extrusionWidth;
-    config.retractionAmount = 4.5;
+    config.supportLineDistance = config.sparseInfillLineDistance;
+    config.supportExtruder = -1;
+    config.supportXYDistance = 700;
+    config.supportZDistance = 150;
+    config.retractionAmount = 4500;
     config.retractionSpeed = 45;
-    config.retractionAmountExtruderSwitch = 14.5;
+    config.retractionAmountExtruderSwitch = 14500;
+    config.retractionMinimalDistance = 1500;
+    config.minimalExtrusionBeforeRetraction = 100;
+    config.enableOozeShield = 0;
+    config.enableCombing = 1;
+    config.enableWipeTower = 0;
     config.multiVolumeOverlap = 0;
 
     config.minimalLayerTime = 5;
@@ -395,7 +107,10 @@ int main(int argc, char **argv)
     config.raftInterfaceThickness = 0;
     config.raftInterfaceLinewidth = 0;
 
+    config.spiralizeMode = 0;
     config.fixHorrible = 0;
+    config.gcodeFlavor = GCODE_FLAVOR_REPRAP;
+    memset(config.extruderOffset, 0, sizeof(config.extruderOffset));
     
     config.startCode =
         "M109 S210     ;Heatup to 210C\n"
@@ -416,7 +131,7 @@ int main(int argc, char **argv)
         "M84                         ;steppers off\n"
         "G90                         ;absolute positioning\n";
 
-    fprintf(stdout,"Cura_SteamEngine version %s\n", VERSION);
+    fprintf(stderr,"Cura_SteamEngine version %s\n", VERSION);
 
     for(int argn = 1; argn < argc; argn++)
     {
@@ -439,13 +154,11 @@ int main(int argc, char **argv)
                     break;
                 case 'o':
                     argn++;
-                    gcode.setFilename(argv[argn]);
-                    if (!gcode.isValid())
+                    if (!processor.setTargetFile(argv[argn]))
                     {
                         logError("Failed to open %s for output.\n", argv[argn]);
                         exit(1);
                     }
-                    gcode.addComment("Generated with Cura_SteamEngine %s", VERSION);
                     break;
                 case 's':
                     {
@@ -456,7 +169,7 @@ int main(int argc, char **argv)
                             *valuePtr++ = '\0';
                             
                             if (!config.setSetting(argv[argn], valuePtr))
-                                printf("Setting found: %s\n", argv[argn]);
+                                printf("Setting found: %s %s\n", argv[argn], valuePtr);
                         }
                     }
                     break;
@@ -473,20 +186,14 @@ int main(int argc, char **argv)
                 }
             }
         }else{
-            if (!gcode.isValid())
-            {
-                logError("No output file specified\n");
-                return 1;
+            try {
+                processor.processFile(argv[argn]);
+            }catch(...){
+                printf("Unknown exception\n");
+                exit(1);
             }
-            processFile(argv[argn], config, gcode, fileNr == 0);
-            fileNr ++;
         }
     }
-    if (gcode.isValid())
-    {
-        gcode.addFanCommand(0);
-        gcode.addCode(config.endCode);
-        log("Print time: %d\n", int(gcode.getTotalPrintTime()));
-        log("Filament: %d\n", int(gcode.getTotalFilamentUsed()));
-    }
+    
+    processor.finalize();
 }

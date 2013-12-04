@@ -6,6 +6,7 @@
 #include <windows.h>
 #else
 #include <sys/time.h>
+#include <stddef.h>
 #endif
 
 static inline double getTime()
@@ -18,13 +19,15 @@ static inline double getTime()
     return double(tv.tv_sec) + double(tv.tv_usec) / 1000000.0;
 #endif
 }
-double t_start = getTime();
 
-static inline double timeElapsed(double &t,bool all_time = false) {
-	double t_passed = getTime() - t;
-	t = getTime();
-	if(all_time)
-		return getTime() - t_start;
-	return t_passed;
-}
+class TimeKeeper
+{
+private:
+    double startTime;
+public:
+    TimeKeeper();
+    
+    double restart();
+};
+
 #endif//GETTIME_H

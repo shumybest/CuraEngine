@@ -2,10 +2,8 @@
 #ifndef SLICE_DATA_STORAGE_H
 #define SLICE_DATA_STORAGE_H
 
-#include <vector>
-using std::vector;
 #include "utils/intpoint.h"
-using ClipperLib::Polygons;
+#include "utils/polygon.h"
 
 /*
 SliceData
@@ -47,6 +45,12 @@ public:
 class SupportStorage
 {
 public:
+    bool generated;
+    int angle;
+    bool everywhere;
+    int XYDistance;
+    int ZDistance;
+    
     Point gridOffset;
     int32_t gridScale;
     int32_t gridWidth, gridHeight;
@@ -66,9 +70,12 @@ public:
     Point3 modelSize, modelMin, modelMax;
     Polygons skirt;
     Polygons raftOutline;
+    vector<Polygons> oozeShield;
     vector<SliceVolumeStorage> volumes;
     
     SupportStorage support;
+    Polygons wipeTower;
+    Point wipePoint;
 };
 
 #endif//SLICE_DATA_STORAGE_H

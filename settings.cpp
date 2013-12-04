@@ -20,21 +20,30 @@ ConfigSettings::ConfigSettings()
     SETTING(infillOverlap);
     SETTING(skirtDistance);
     SETTING(skirtLineCount);
+    SETTING(skirtMinLength);
 
     SETTING(initialSpeedupLayers);
     SETTING(initialLayerSpeed);
     SETTING(printSpeed);
     SETTING(infillSpeed);
     SETTING(moveSpeed);
-    SETTING(fanOnLayerNr);
+    SETTING(fanFullOnLayerNr);
     
     SETTING(supportAngle);
     SETTING(supportEverywhere);
-    SETTING(supportLineWidth);
+    SETTING(supportLineDistance);
+    SETTING(supportXYDistance);
+    SETTING(supportZDistance);
+    SETTING(supportExtruder);
     
     SETTING(retractionAmount);
     SETTING(retractionSpeed);
     SETTING(retractionAmountExtruderSwitch);
+    SETTING(retractionMinimalDistance);
+    SETTING(minimalExtrusionBeforeRetraction);
+    SETTING(enableCombing);
+    SETTING(enableOozeShield);
+    SETTING(enableWipeTower);
     SETTING(multiVolumeOverlap);
     SETTING2(objectPosition.X, posx);
     SETTING2(objectPosition.Y, posy);
@@ -54,6 +63,8 @@ ConfigSettings::ConfigSettings()
     SETTING(fanSpeedMax);
     
     SETTING(fixHorrible);
+    SETTING(spiralizeMode);
+    SETTING(gcodeFlavor);
     
     SETTING(extruderOffset[1].X);
     SETTING(extruderOffset[1].Y);
