@@ -8,7 +8,10 @@
 #include "comb.h"
 #include "utils/intpoint.h"
 #include "utils/polygon.h"
+#include "timeEstimate.h"
 
+//The GCodeExport class writes the actual GCode. This is the only class that knows how GCode looks and feels.
+//  Any customizations on GCodes flavors are done in this class.
 class GCodeExport
 {
 private:
@@ -16,11 +19,14 @@ private:
     double extrusionAmount;
     double extrusionPerMM;
     double retractionAmount;
+    double retractionAmountPrime;
+    int retractionZHop;
     double extruderSwitchRetraction;
     double minimalExtrusionBeforeRetraction;
     double extrusionAmountAtPreviousRetraction;
     Point3 currentPosition;
     Point extruderOffset[MAX_EXTRUDERS];
+    char extruderCharacter[MAX_EXTRUDERS];
     int currentSpeed, retractionSpeed;
     int zPos;
     bool isRetracted;
@@ -29,8 +35,9 @@ private:
     int flavor;
     
     double totalFilament[MAX_EXTRUDERS];
-public:
     double totalPrintTime;
+    TimeEstimateCalculator estimateCalculator;
+public:
     
     GCodeExport();
     
@@ -45,11 +52,11 @@ public:
     
     void setFilename(const char* filename);
     
-    bool isValid();
+    bool isOpened();
     
     void setExtrusion(int layerThickness, int filamentDiameter, int flow);
     
-    void setRetractionSettings(int retractionAmount, int retractionSpeed, int extruderSwitchRetraction, int minimalExtrusionBeforeRetraction);
+    void setRetractionSettings(int retractionAmount, int retractionSpeed, int extruderSwitchRetraction, int minimalExtrusionBeforeRetraction, int zHop, int retractionAmountPrime);
     
     void setZ(int z);
     
@@ -62,29 +69,33 @@ public:
     double getTotalFilamentUsed(int e);
 
     double getTotalPrintTime();
+    void updateTotalPrintTime();
     
-    void addComment(const char* comment, ...);
+    void writeComment(const char* comment, ...);
 
-    void addLine(const char* line, ...);
+    void writeLine(const char* line, ...);
     
     void resetExtrusionValue();
     
-    void addDelay(double timeAmount);
+    void writeDelay(double timeAmount);
     
-    void addMove(Point p, int speed, int lineWidth);
+    void writeMove(Point p, int speed, int lineWidth);
     
-    void addRetraction();
+    void writeRetraction();
     
     void switchExtruder(int newExtruder);
     
-    void addCode(const char* str);
+    void writeCode(const char* str);
     
-    void addFanCommand(int speed);
+    void writeFanCommand(int speed);
+    
+    void finalize(int maxObjectHeight, int moveSpeed, const char* endCode);
 
     int getFileSize();
     void tellFileSize();
 };
 
+//The GCodePathConfig is the configuration for moves/extrusion actions. This defines at which width the line is printed and at which speed.
 class GCodePathConfig
 {
 public:
@@ -114,6 +125,9 @@ public:
     bool done;//Path is finished, no more moves should be added, and a new path should be started instead of any appending done to this one.
 };
 
+//The GCodePlanner class stores multiple moves that are planned.
+// It facilitates the combing to keep the head inside the print.
+// It also keeps track of the print time estimate for this planning so speed adjustments can be made for the minimal-layer-time.
 class GCodePlanner
 {
 private:
@@ -197,7 +211,7 @@ public:
     
     void moveInsideCombBoundary(int distance);
 
-    void addPolygon(ClipperLib::Polygon& polygon, int startIdx, GCodePathConfig* config);
+    void addPolygon(PolygonRef polygon, int startIdx, GCodePathConfig* config);
 
     void addPolygonsByOptimizer(Polygons& polygons, GCodePathConfig* config);
     

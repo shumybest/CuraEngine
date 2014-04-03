@@ -7,7 +7,7 @@ Floating point 3D points are used during model loading as 3D vectors.
 They represent millimeters in 3D space.
 */
 
-#include "utils/intpoint.h"
+#include "intpoint.h"
 
 #include <stdint.h>
 #include <math.h>
@@ -74,9 +74,9 @@ public:
     Point3 apply(FPoint3 p)
     {
         return Point3(
-            (p.x * m[0][0] + p.y * m[1][0] + p.z * m[2][0]) * 1000.0,
-            (p.x * m[0][1] + p.y * m[1][1] + p.z * m[2][1]) * 1000.0,
-            (p.x * m[0][2] + p.y * m[1][2] + p.z * m[2][2]) * 1000.0);
+            MM2INT(p.x * m[0][0] + p.y * m[1][0] + p.z * m[2][0]),
+            MM2INT(p.x * m[0][1] + p.y * m[1][1] + p.z * m[2][1]),
+            MM2INT(p.x * m[0][2] + p.y * m[1][2] + p.z * m[2][2]));
     }
 };
 

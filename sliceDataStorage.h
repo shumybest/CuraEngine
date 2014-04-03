@@ -30,6 +30,8 @@ public:
 class SliceLayer
 {
 public:
+    int sliceZ;
+    int printZ;
     vector<SliceLayerPart> parts;
 };
 
@@ -55,6 +57,8 @@ public:
     int32_t gridScale;
     int32_t gridWidth, gridHeight;
     vector<SupportPoint>* grid;
+   	SupportStorage(){grid = NULL;}
+	  ~SupportStorage(){if(grid) delete [] grid;}
 };
 /******************/
 
@@ -69,8 +73,8 @@ class SliceDataStorage
 public:
     Point3 modelSize, modelMin, modelMax;
     Polygons skirt;
-    Polygons raftOutline;
-    vector<Polygons> oozeShield;
+    Polygons raftOutline;               //Storage for the outline of the raft. Will be filled with lines when the GCode is generated.
+    vector<Polygons> oozeShield;        //oozeShield per layer
     vector<SliceVolumeStorage> volumes;
     
     SupportStorage support;

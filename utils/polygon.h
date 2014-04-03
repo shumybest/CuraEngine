@@ -2,41 +2,187 @@
 #define UTILS_POLYGON_H
 
 #include <vector>
+#include <assert.h>
+#include <float.h>
 using std::vector;
-#include "clipper/clipper.hpp"
+#include "../clipper/clipper.hpp"
 
-#include "utils/intpoint.h"
+#include "intpoint.h"
+
+//#define CHECK_POLY_ACCESS
+#ifdef CHECK_POLY_ACCESS
+#define POLY_ASSERT(e) assert(e)
+#else
+#define POLY_ASSERT(e) do {} while(0)
+#endif
+
+#define CLIPPER_INIT (0)
+
+class PolygonRef
+{
+    ClipperLib::Path* polygon;
+    PolygonRef()
+    : polygon(NULL)
+    {}
+public:
+    PolygonRef(ClipperLib::Path& polygon)
+    : polygon(&polygon)
+    {}
+    
+    unsigned int size() const
+    {
+        return polygon->size();
+    }
+    
+    Point operator[] (unsigned int index) const
+    {
+        POLY_ASSERT(index < size());
+        return (*polygon)[index];
+    }
+    
+    void* data()
+    {
+        return polygon->data();
+    }
+    
+    void add(const Point p)
+    {
+        polygon->push_back(p);
+    }
+
+    void remove(unsigned int index)
+    {
+        POLY_ASSERT(index < size());
+        polygon->erase(polygon->begin() + index);
+    }
+    
+    void clear()
+    {
+        polygon->clear();
+    }
+
+    bool orientation() const
+    {
+        return ClipperLib::Orientation(*polygon);
+    }
+    
+    void reverse()
+    {
+        ClipperLib::ReversePath(*polygon);
+    }
+
+    int64_t polygonLength() const
+    {
+        int64_t length = 0;
+        Point p0 = (*polygon)[polygon->size()-1];
+        for(unsigned int n=0; n<polygon->size(); n++)
+        {
+            Point p1 = (*polygon)[n];
+            length += vSize(p0 - p1);
+            p0 = p1;
+        }
+        return length;
+    }
+    
+    double area() const
+    {
+        return ClipperLib::Area(*polygon);
+    }
+
+    Point centerOfMass() const
+    {
+        double x = 0, y = 0;
+        Point p0 = (*polygon)[polygon->size()-1];
+        for(unsigned int n=0; n<polygon->size(); n++)
+        {
+            Point p1 = (*polygon)[n];
+            double second_factor = (p0.X * p1.Y) - (p1.X * p0.Y);
+            
+            x += double(p0.X + p1.X) * second_factor;
+            y += double(p0.Y + p1.Y) * second_factor;
+            p0 = p1;
+        }
+
+        double area = Area(*polygon);
+        x = x / 6 / area;
+        y = y / 6 / area;
+
+        if (x < 0)
+        {
+            x = -x;
+            y = -y;
+        }
+        return Point(x, y);
+    }
+    
+    Point closestPointTo(Point p)
+    {
+        Point ret = p;
+        float bestDist = FLT_MAX;
+        for(unsigned int n=0; n<polygon->size(); n++)
+        {
+            float dist = vSize2f(p - (*polygon)[n]);
+            if (dist < bestDist)
+            {
+                ret = (*polygon)[n];
+                bestDist = dist;
+            }
+        }
+        return ret;
+    }
+    
+    friend class Polygons;
+};
+
+class _Polygon : public PolygonRef
+{
+    ClipperLib::Path poly;
+public:
+    _Polygon()
+    : PolygonRef(poly)
+    {
+    }
+};
+//<windows.h> defines a Polygon structure, to prevent a clash define Polygon as _Polygon.
+#define Polygon _Polygon
 
 class Polygons
 {
 private:
-    ClipperLib::Polygons polygons;
+    ClipperLib::Paths polygons;
 public:
     unsigned int size()
     {
         return polygons.size();
     }
     
-    ClipperLib::Polygon& operator[] (int index) //__attribute__((__deprecated__))
+    PolygonRef operator[] (unsigned int index)
     {
-        return polygons[index];
+        POLY_ASSERT(index < size());
+        return PolygonRef(polygons[index]);
     }
-    void remove(int index)
+    void remove(unsigned int index)
     {
+        POLY_ASSERT(index < size());
         polygons.erase(polygons.begin() + index);
     }
     void clear()
     {
         polygons.clear();
     }
-    void add(const ClipperLib::Polygon& poly)
+    void add(const PolygonRef& poly)
     {
-        polygons.push_back(poly);
+        polygons.push_back(*poly.polygon);
     }
     void add(const Polygons& other)
     {
         for(unsigned int n=0; n<other.polygons.size(); n++)
             polygons.push_back(other.polygons[n]);
+    }
+    PolygonRef newPoly()
+    {
+        polygons.push_back(ClipperLib::Path());
+        return PolygonRef(polygons[polygons.size()-1]);
     }
     
     Polygons() {}
@@ -45,42 +191,45 @@ public:
     Polygons difference(const Polygons& other) const
     {
         Polygons ret;
-        ClipperLib::Clipper clipper;
-        clipper.AddPolygons(polygons, ClipperLib::ptSubject);
-        clipper.AddPolygons(other.polygons, ClipperLib::ptClip);
+        ClipperLib::Clipper clipper(CLIPPER_INIT);
+        clipper.AddPaths(polygons, ClipperLib::ptSubject, true);
+        clipper.AddPaths(other.polygons, ClipperLib::ptClip, true);
         clipper.Execute(ClipperLib::ctDifference, ret.polygons);
         return ret;
     }
     Polygons unionPolygons(const Polygons& other) const
     {
         Polygons ret;
-        ClipperLib::Clipper clipper;
-        clipper.AddPolygons(polygons, ClipperLib::ptSubject);
-        clipper.AddPolygons(other.polygons, ClipperLib::ptSubject);
+        ClipperLib::Clipper clipper(CLIPPER_INIT);
+        clipper.AddPaths(polygons, ClipperLib::ptSubject, true);
+        clipper.AddPaths(other.polygons, ClipperLib::ptSubject, true);
         clipper.Execute(ClipperLib::ctUnion, ret.polygons, ClipperLib::pftNonZero, ClipperLib::pftNonZero);
         return ret;
     }
     Polygons intersection(const Polygons& other) const
     {
         Polygons ret;
-        ClipperLib::Clipper clipper;
-        clipper.AddPolygons(polygons, ClipperLib::ptSubject);
-        clipper.AddPolygons(other.polygons, ClipperLib::ptClip);
+        ClipperLib::Clipper clipper(CLIPPER_INIT);
+        clipper.AddPaths(polygons, ClipperLib::ptSubject, true);
+        clipper.AddPaths(other.polygons, ClipperLib::ptClip, true);
         clipper.Execute(ClipperLib::ctIntersection, ret.polygons);
         return ret;
     }
     Polygons offset(int distance) const
     {
         Polygons ret;
-        ClipperLib::OffsetPolygons(polygons, ret.polygons, distance, ClipperLib::jtSquare, 2, false);
+        ClipperLib::ClipperOffset clipper;
+        clipper.AddPaths(polygons, ClipperLib::jtMiter, ClipperLib::etClosedPolygon);
+        clipper.MiterLimit = 2.0;
+        clipper.Execute(ret.polygons, distance);
         return ret;
     }
     vector<Polygons> splitIntoParts(bool unionAll = false) const
     {
         vector<Polygons> ret;
-        ClipperLib::Clipper clipper;
+        ClipperLib::Clipper clipper(CLIPPER_INIT);
         ClipperLib::PolyTree resultPolyTree;
-        clipper.AddPolygons(polygons, ClipperLib::ptSubject);
+        clipper.AddPaths(polygons, ClipperLib::ptSubject, true);
         if (unionAll)
             clipper.Execute(ClipperLib::ctUnion, resultPolyTree, ClipperLib::pftNonZero, ClipperLib::pftNonZero);
         else
@@ -89,6 +238,7 @@ public:
         _processPolyTreeNode(&resultPolyTree, ret);
         return ret;
     }
+private:
     void _processPolyTreeNode(ClipperLib::PolyNode* node, vector<Polygons>& ret) const
     {
         for(int n=0; n<node->ChildCount(); n++)
@@ -103,6 +253,15 @@ public:
             }
             ret.push_back(polygons);
         }
+    }
+public:
+    Polygons processEvenOdd() const
+    {
+        Polygons ret;
+        ClipperLib::Clipper clipper(CLIPPER_INIT);
+        clipper.AddPaths(polygons, ClipperLib::ptSubject, true);
+        clipper.Execute(ClipperLib::ctUnion, ret.polygons);
+        return ret;
     }
     
     int64_t polygonLength() const
@@ -132,32 +291,6 @@ public:
         }
     }
 };
-
-INLINE Point centerOfMass(const ClipperLib::Polygon& poly)
-{
-    double x = 0, y = 0;
-    Point p0 = poly[poly.size()-1];
-    for(unsigned int n=0; n<poly.size(); n++)
-    {
-        Point p1 = poly[n];
-        double second_factor = (p0.X * p1.Y) - (p1.X * p0.Y);
-        
-        x += double(p0.X + p1.X) * second_factor;
-        y += double(p0.Y + p1.Y) * second_factor;
-        p0 = p1;
-    }
-
-    double area = Area(poly);
-    x = x / 6 / area;
-    y = y / 6 / area;
-
-    if (x < 0)
-    {
-        x = -x;
-        y = -y;
-    }
-    return Point(x, y);
-}
 
 /* Axis aligned boundary box */
 class AABB

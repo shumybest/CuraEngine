@@ -2,23 +2,41 @@
 #include "skirt.h"
 #include "support.h"
 
-void generateSkirt(SliceDataStorage& storage, int distance, int extrusionWidth, int count, int minLength)
+void generateSkirt(SliceDataStorage& storage, int distance, int extrusionWidth, int count, int minLength, int initialLayerHeight)
 {
+    bool externalOnly = (distance > 0);
     for(int skirtNr=0; skirtNr<count;skirtNr++)
     {
-        Polygons skirtPolygons;
+        int offsetDistance = distance + extrusionWidth * skirtNr + extrusionWidth / 2;
+        
+        Polygons skirtPolygons(storage.wipeTower.offset(offsetDistance));
         for(unsigned int volumeIdx = 0; volumeIdx < storage.volumes.size(); volumeIdx++)
         {
             if (storage.volumes[volumeIdx].layers.size() < 1) continue;
             SliceLayer* layer = &storage.volumes[volumeIdx].layers[0];
             for(unsigned int i=0; i<layer->parts.size(); i++)
             {
-                skirtPolygons = skirtPolygons.unionPolygons(layer->parts[i].outline.offset(distance + extrusionWidth * skirtNr + extrusionWidth / 2));
+                if (externalOnly)
+                {
+                    Polygons p;
+                    p.add(layer->parts[i].outline[0]);
+                    skirtPolygons = skirtPolygons.unionPolygons(p.offset(offsetDistance));
+                }
+                else
+                    skirtPolygons = skirtPolygons.unionPolygons(layer->parts[i].outline.offset(offsetDistance));
             }
         }
         
-        SupportPolyGenerator supportGenerator(storage.support, 0);
-        skirtPolygons = skirtPolygons.unionPolygons(supportGenerator.polygons.offset(distance + extrusionWidth * skirtNr + extrusionWidth / 2));
+        SupportPolyGenerator supportGenerator(storage.support, initialLayerHeight);
+        skirtPolygons = skirtPolygons.unionPolygons(supportGenerator.polygons.offset(offsetDistance));
+
+        //Remove small inner skirt holes. Holes have a negative area, remove anything smaller then 100x extrusion "area"
+        for(unsigned int n=0; n<skirtPolygons.size(); n++)
+        {
+            double area = skirtPolygons[n].area();
+            if (area < 0 && area > -extrusionWidth * extrusionWidth * 100)
+                skirtPolygons.remove(n--);
+        }
 
         storage.skirt.add(skirtPolygons);
         

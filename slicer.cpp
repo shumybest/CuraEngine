@@ -2,6 +2,7 @@
 #include <stdio.h>
 
 #include "utils/gettime.h"
+#include "utils/logoutput.h"
 
 #include "slicer.h"
 #include "polygonOptimizer.h"
@@ -13,8 +14,8 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
         if (segmentList[startSegment].addedToPolygon)
             continue;
         
-        ClipperLib::Polygon poly;
-        poly.push_back(segmentList[startSegment].start);
+        Polygon poly;
+        poly.add(segmentList[startSegment].start);
         
         unsigned int segmentIndex = startSegment;
         bool canClose;
@@ -23,7 +24,7 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
             canClose = false;
             segmentList[segmentIndex].addedToPolygon = true;
             Point p0 = segmentList[segmentIndex].end;
-            poly.push_back(p0);
+            poly.add(p0);
             int nextIndex = -1;
             OptimizedFace* face = &ov->faces[segmentList[segmentIndex].faceIndex];
             for(unsigned int i=0;i<3;i++)
@@ -32,7 +33,7 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
                 {
                     Point p1 = segmentList[faceToSegmentIndex[face->touching[i]]].start;
                     Point diff = p0 - p1;
-                    if (shorterThen(diff, 10))
+                    if (shorterThen(diff, MM2INT(0.01)))
                     {
                         if (faceToSegmentIndex[face->touching[i]] == (int)startSegment)
                             canClose = true;
@@ -66,7 +67,7 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
             Point diff = openPolygonList[i][openPolygonList[i].size()-1] - openPolygonList[j][0];
             int64_t distSquared = vSize2(diff);
 
-            if (distSquared < 2 * 2)
+            if (distSquared < MM2INT(0.02) * MM2INT(0.02))
             {
                 if (i == j)
                 {
@@ -75,18 +76,18 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
                     break;
                 }else{
                     for(unsigned int n=0; n<openPolygonList[j].size(); n++)
-                        openPolygonList[i].push_back(openPolygonList[j][n]);
+                        openPolygonList[i].add(openPolygonList[j][n]);
 
                     openPolygonList[j].clear();
                 }
             }
         }
     }
-    
+
     //Next link up all the missing ends, closing up the smallest gaps first. This is an inefficient implementation which can run in O(n*n*n) time.
     while(1)
     {
-        int64_t bestScore = 10000 * 10000;
+        int64_t bestScore = MM2INT(10.0) * MM2INT(10.0);
         unsigned int bestA = -1;
         unsigned int bestB = -1;
         bool reversed = false;
@@ -122,7 +123,7 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
             }
         }
         
-        if (bestScore >= 10000 * 10000)
+        if (bestScore >= MM2INT(10.0) * MM2INT(10.0))
             break;
         
         if (bestA == bestB)
@@ -132,14 +133,21 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
         }else{
             if (reversed)
             {
-                for(unsigned int n=openPolygonList[bestB].size()-1; int(n)>=0; n--)
-                    openPolygonList[bestA].push_back(openPolygonList[bestB][n]);
+                if (openPolygonList[bestA].polygonLength() > openPolygonList[bestB].polygonLength())
+                {
+                    for(unsigned int n=openPolygonList[bestB].size()-1; int(n)>=0; n--)
+                        openPolygonList[bestA].add(openPolygonList[bestB][n]);
+                    openPolygonList[bestB].clear();
+                }else{
+                    for(unsigned int n=openPolygonList[bestA].size()-1; int(n)>=0; n--)
+                        openPolygonList[bestB].add(openPolygonList[bestA][n]);
+                    openPolygonList[bestA].clear();
+                }
             }else{
                 for(unsigned int n=0; n<openPolygonList[bestB].size(); n++)
-                    openPolygonList[bestA].push_back(openPolygonList[bestB][n]);
+                    openPolygonList[bestA].add(openPolygonList[bestB][n]);
+                openPolygonList[bestB].clear();
             }
-
-            openPolygonList[bestB].clear();
         }
     }
 
@@ -199,12 +207,11 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
                     }
                     else if (bestResult.AtoB)
                     {
-                        unsigned int n = polygonList.size();
-                        polygonList.add(ClipperLib::Polygon());
+                        PolygonRef poly = polygonList.newPoly();
                         for(unsigned int j = bestResult.pointIdxA; j != bestResult.pointIdxB; j = (j + 1) % polygonList[bestResult.polygonIdx].size())
-                            polygonList[n].push_back(polygonList[bestResult.polygonIdx][j]);
+                            poly.add(polygonList[bestResult.polygonIdx][j]);
                         for(unsigned int j = openPolygonList[bestA].size() - 1; int(j) >= 0; j--)
-                            polygonList[n].push_back(openPolygonList[bestA][j]);
+                            poly.add(openPolygonList[bestA][j]);
                         openPolygonList[bestA].clear();
                     }
                     else
@@ -212,7 +219,7 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
                         unsigned int n = polygonList.size();
                         polygonList.add(openPolygonList[bestA]);
                         for(unsigned int j = bestResult.pointIdxB; j != bestResult.pointIdxA; j = (j + 1) % polygonList[bestResult.polygonIdx].size())
-                            polygonList[n].push_back(polygonList[bestResult.polygonIdx][j]);
+                            polygonList[n].add(polygonList[bestResult.polygonIdx][j]);
                         openPolygonList[bestA].clear();
                     }
                 }
@@ -221,26 +228,26 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
                     if (bestResult.pointIdxA == bestResult.pointIdxB)
                     {
                         for(unsigned int n=0; n<openPolygonList[bestA].size(); n++)
-                            openPolygonList[bestB].push_back(openPolygonList[bestA][n]);
+                            openPolygonList[bestB].add(openPolygonList[bestA][n]);
                         openPolygonList[bestA].clear();
                     }
                     else if (bestResult.AtoB)
                     {
-                        ClipperLib::Polygon poly;
+                        Polygon poly;
                         for(unsigned int n = bestResult.pointIdxA; n != bestResult.pointIdxB; n = (n + 1) % polygonList[bestResult.polygonIdx].size())
-                            poly.push_back(polygonList[bestResult.polygonIdx][n]);
+                            poly.add(polygonList[bestResult.polygonIdx][n]);
                         for(unsigned int n=poly.size()-1;int(n) >= 0; n--)
-                            openPolygonList[bestB].push_back(poly[n]);
+                            openPolygonList[bestB].add(poly[n]);
                         for(unsigned int n=0; n<openPolygonList[bestA].size(); n++)
-                            openPolygonList[bestB].push_back(openPolygonList[bestA][n]);
+                            openPolygonList[bestB].add(openPolygonList[bestA][n]);
                         openPolygonList[bestA].clear();
                     }
                     else
                     {
                         for(unsigned int n = bestResult.pointIdxB; n != bestResult.pointIdxA; n = (n + 1) % polygonList[bestResult.polygonIdx].size())
-                            openPolygonList[bestB].push_back(polygonList[bestResult.polygonIdx][n]);
+                            openPolygonList[bestB].add(polygonList[bestResult.polygonIdx][n]);
                         for(unsigned int n = openPolygonList[bestA].size() - 1; int(n) >= 0; n--)
-                            openPolygonList[bestB].push_back(openPolygonList[bestA][n]);
+                            openPolygonList[bestB].add(openPolygonList[bestA][n]);
                         openPolygonList[bestA].clear();
                     }
                 }
@@ -257,9 +264,9 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
     for(unsigned int i=0;i<openPolygonList.size();i++)
     {
         if (openPolygonList[i].size() < 2) continue;
-        if (!q) printf("***\n");
-        printf("S: %f %f\n", float(openPolygonList[i][0].X), float(openPolygonList[i][0].Y));
-        printf("E: %f %f\n", float(openPolygonList[i][openPolygonList[i].size()-1].X), float(openPolygonList[i][openPolygonList[i].size()-1].Y));
+        if (!q) log("***\n");
+        log("S: %f %f\n", float(openPolygonList[i][0].X), float(openPolygonList[i][0].Y));
+        log("E: %f %f\n", float(openPolygonList[i][openPolygonList[i].size()-1].X), float(openPolygonList[i][openPolygonList[i].size()-1].Y));
         q = 1;
     }
     */
@@ -277,7 +284,7 @@ void SlicerLayer::makePolygons(OptimizedVolume* ov, bool keepNoneClosed, bool ex
     //openPolygonList.clear();
 
     //Remove all the tiny polygons, or polygons that are not closed. As they do not contribute to the actual print.
-    int snapDistance = 1000;
+    int snapDistance = MM2INT(1.0);
     for(unsigned int i=0;i<polygonList.size();i++)
     {
         int length = 0;
@@ -306,8 +313,13 @@ Slicer::Slicer(OptimizedVolume* ov, int32_t initial, int32_t thickness, bool kee
     modelMin = ov->model->vMin;
     
     int layerCount = (modelSize.z - initial) / thickness + 1;
-    fprintf(stderr, "Layer count: %i\n", layerCount);
+    log("Layer count: %i\n", layerCount);
     layers.resize(layerCount);
+    
+    for(int32_t layerNr = 0; layerNr < layerCount; layerNr++)
+    {
+        layers[layerNr].z = initial + thickness * layerNr;
+    }
     
     for(unsigned int i=0; i<ov->faces.size(); i++)
     {
@@ -369,11 +381,14 @@ void Slicer::dumpSegmentsToHTML(const char* filename)
     for(unsigned int i=0; i<layers.size(); i++)
     {
         fprintf(f, "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" style='width:%ipx;height:%ipx'>\n", int(modelSize.x / scale), int(modelSize.y / scale));
+        fprintf(f, "<marker id='MidMarker' viewBox='0 0 10 10' refX='5' refY='5' markerUnits='strokeWidth' markerWidth='10' markerHeight='10' stroke='lightblue' stroke-width='2' fill='none' orient='auto'>");
+        fprintf(f, "<path d='M 0 0 L 10 5 M 0 10 L 10 5'/>");
+        fprintf(f, "</marker>");
         fprintf(f, "<g fill-rule='evenodd' style=\"fill: gray; stroke:black;stroke-width:1\">\n");
-        fprintf(f, "<path d=\"");
+        fprintf(f, "<path marker-mid='url(#MidMarker)' d=\"");
         for(unsigned int j=0; j<layers[i].polygonList.size(); j++)
         {
-            ClipperLib::Polygon& p = layers[i].polygonList[j];
+            PolygonRef p = layers[i].polygonList[j];
             for(unsigned int n=0; n<p.size(); n++)
             {
                 if (n == 0)
@@ -388,9 +403,9 @@ void Slicer::dumpSegmentsToHTML(const char* filename)
         fprintf(f, "</g>\n");
         for(unsigned int j=0; j<layers[i].openPolygonList.size(); j++)
         {
-            ClipperLib::Polygon& p = layers[i].openPolygonList[j];
+            PolygonRef p = layers[i].openPolygonList[j];
             if (p.size() < 1) continue;
-            fprintf(f, "<polyline points=\"");
+            fprintf(f, "<polyline marker-mid='url(#MidMarker)' points=\"");
             for(unsigned int n=0; n<p.size(); n++)
             {
                 fprintf(f, "%f,%f ", float(p[n].X - modelMin.x)/scale, float(p[n].Y - modelMin.y)/scale);

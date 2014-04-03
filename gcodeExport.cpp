@@ -3,7 +3,9 @@
 
 #include "gcodeExport.h"
 #include "pathOrderOptimizer.h"
+#include "timeEstimate.h"
 #include "settings.h"
+#include "utils/logoutput.h"
 
 #if defined(__APPLE__) && defined(__MACH__)
 //On MacOS the file offset functions are always 64bit.
@@ -31,18 +33,24 @@ GCodeExport::GCodeExport()
     currentSpeed = 0;
     retractionSpeed = 45;
     isRetracted = true;
+    setFlavor(GCODE_FLAVOR_REPRAP);
     memset(extruderOffset, 0, sizeof(extruderOffset));
     f = stdout;
 }
 
 GCodeExport::~GCodeExport()
 {
-    if (f)
+    if (f && f != stdout)
         fclose(f);
 }
 
 void GCodeExport::replaceTagInStart(const char* tag, const char* replaceValue)
 {
+    if (f == stdout)
+    {
+        log("Replace:%s:%s\n", tag, replaceValue);
+        return;
+    }
     off64_t oldPos = ftello64(f);
     
     char buffer[1024];
@@ -67,6 +75,12 @@ void GCodeExport::setExtruderOffset(int id, Point p)
 void GCodeExport::setFlavor(int flavor)
 {
     this->flavor = flavor;
+    if (flavor == GCODE_FLAVOR_MACH3)
+        for(int n=0; n<MAX_EXTRUDERS; n++)
+            extruderCharacter[n] = 'A' + n;
+    else
+        for(int n=0; n<MAX_EXTRUDERS; n++)
+            extruderCharacter[n] = 'E';
 }
 int GCodeExport::getFlavor()
 {
@@ -78,26 +92,28 @@ void GCodeExport::setFilename(const char* filename)
     f = fopen(filename, "w+");
 }
 
-bool GCodeExport::isValid()
+bool GCodeExport::isOpened()
 {
     return f != NULL;
 }
 
 void GCodeExport::setExtrusion(int layerThickness, int filamentDiameter, int flow)
 {
-    double filamentArea = M_PI * (double(filamentDiameter) / 1000.0 / 2.0) * (double(filamentDiameter) / 1000.0 / 2.0);
+    double filamentArea = M_PI * (INT2MM(filamentDiameter) / 2.0) * (INT2MM(filamentDiameter) / 2.0);
     if (flavor == GCODE_FLAVOR_ULTIGCODE)//UltiGCode uses volume extrusion as E value, and thus does not need the filamentArea in the mix.
-        extrusionPerMM = double(layerThickness) / 1000.0;
+        extrusionPerMM = INT2MM(layerThickness);
     else
-        extrusionPerMM = double(layerThickness) / 1000.0 / filamentArea * double(flow) / 100.0;
+        extrusionPerMM = INT2MM(layerThickness) / filamentArea * double(flow) / 100.0;
 }
 
-void GCodeExport::setRetractionSettings(int retractionAmount, int retractionSpeed, int extruderSwitchRetraction, int minimalExtrusionBeforeRetraction)
+void GCodeExport::setRetractionSettings(int retractionAmount, int retractionSpeed, int extruderSwitchRetraction, int minimalExtrusionBeforeRetraction, int zHop, int retractionAmountPrime)
 {
-    this->retractionAmount = double(retractionAmount) / 1000.0;
+    this->retractionAmount = INT2MM(retractionAmount);
+    this->retractionAmountPrime = INT2MM(retractionAmountPrime);
     this->retractionSpeed = retractionSpeed;
-    this->extruderSwitchRetraction = double(extruderSwitchRetraction) / 1000.0;
-    this->minimalExtrusionBeforeRetraction = double(minimalExtrusionBeforeRetraction) / 1000.0;
+    this->extruderSwitchRetraction = INT2MM(extruderSwitchRetraction);
+    this->minimalExtrusionBeforeRetraction = INT2MM(minimalExtrusionBeforeRetraction);
+    this->retractionZHop = zHop;
 }
 
 void GCodeExport::setZ(int z)
@@ -132,7 +148,13 @@ double GCodeExport::getTotalPrintTime()
     return totalPrintTime;
 }
 
-void GCodeExport::addComment(const char* comment, ...)
+void GCodeExport::updateTotalPrintTime()
+{
+    totalPrintTime += estimateCalculator.calculate();
+    estimateCalculator.reset();
+}
+
+void GCodeExport::writeComment(const char* comment, ...)
 {
     va_list args;
     va_start(args, comment);
@@ -142,7 +164,7 @@ void GCodeExport::addComment(const char* comment, ...)
     va_end(args);
 }
 
-void GCodeExport::addLine(const char* line, ...)
+void GCodeExport::writeLine(const char* line, ...)
 {
     va_list args;
     va_start(args, line);
@@ -153,70 +175,123 @@ void GCodeExport::addLine(const char* line, ...)
 
 void GCodeExport::resetExtrusionValue()
 {
-    if (extrusionAmount != 0.0)
+    if (extrusionAmount != 0.0 && flavor != GCODE_FLAVOR_MAKERBOT && flavor != GCODE_FLAVOR_BFB)
     {
-        fprintf(f, "G92 E0\n");
+        fprintf(f, "G92 %c0\n", extruderCharacter[extruderNr]);
         totalFilament[extruderNr] += extrusionAmount;
         extrusionAmountAtPreviousRetraction -= extrusionAmount;
         extrusionAmount = 0.0;
     }
 }
 
-void GCodeExport::addDelay(double timeAmount)
+void GCodeExport::writeDelay(double timeAmount)
 {
     fprintf(f, "G4 P%d\n", int(timeAmount * 1000));
+    totalPrintTime += timeAmount;
 }
 
-void GCodeExport::addMove(Point p, int speed, int lineWidth)
+void GCodeExport::writeMove(Point p, int speed, int lineWidth)
 {
-    if (lineWidth != 0)
+    if (flavor == GCODE_FLAVOR_BFB)
     {
-        Point diff = p - getPositionXY();
-        if (isRetracted)
+        //For Bits From Bytes machines, we need to handle this completely differently. As they do not use E values but RPM values.
+        float fspeed = speed * 60;
+        float rpm = (extrusionPerMM * double(lineWidth) / 1000.0) * speed * 60;
+        const float mm_per_rpm = 4.0; //All BFB machines have 4mm per RPM extrusion.
+        rpm /= mm_per_rpm;
+        if (rpm > 0)
         {
-            if (flavor == GCODE_FLAVOR_ULTIGCODE)
+            if (isRetracted)
             {
-                fprintf(f, "G11\n");
-            }else{
-                fprintf(f, "G1 F%i E%0.5lf\n", retractionSpeed * 60, extrusionAmount);
-                currentSpeed = retractionSpeed;
+                if (currentSpeed != int(rpm * 10))
+                {
+                    //fprintf(f, "; %f e-per-mm %d mm-width %d mm/s\n", extrusionPerMM, lineWidth, speed);
+                    fprintf(f, "M108 S%0.1f\n", rpm);
+                    currentSpeed = int(rpm * 10);
+                }
+                fprintf(f, "M%d01\n", extruderNr);
+                isRetracted = false;
             }
-            if (extrusionAmount > 10000.0) //According to https://github.com/Ultimaker/CuraEngine/issues/14 having more then 21m of extrusion causes inaccuracies. So reset it every 10m, just to be sure.
-                resetExtrusionValue();
-            isRetracted = false;
+            //Fix the speed by the actual RPM we are asking, because of rounding errors we cannot get all RPM values, but we have a lot more resolution in the feedrate value.
+            // (Trick copied from KISSlicer, thanks Jonathan)
+            fspeed *= (rpm / (roundf(rpm * 100) / 100));
+
+            //Increase the extrusion amount to calculate the amount of filament used.
+            Point diff = p - getPositionXY();
+            extrusionAmount += extrusionPerMM * INT2MM(lineWidth) * vSizeMM(diff);
+        }else{
+            //If we are not extruding, check if we still need to disable the extruder. This causes a retraction due to auto-retraction.
+            if (!isRetracted)
+            {
+                fprintf(f, "M103\n");
+                isRetracted = true;
+            }
         }
-        extrusionAmount += extrusionPerMM * double(lineWidth) / 1000.0 * vSizeMM(diff);
-        fprintf(f, "G1");
+        fprintf(f, "G1 X%0.2f Y%0.2f Z%0.2f F%0.1f\n", INT2MM(p.X - extruderOffset[extruderNr].X), INT2MM(p.Y - extruderOffset[extruderNr].Y), INT2MM(zPos), fspeed);
     }else{
-        fprintf(f, "G0");
+        
+        //Normal E handling.
+        if (lineWidth != 0)
+        {
+            Point diff = p - getPositionXY();
+            if (isRetracted)
+            {
+                if (retractionZHop > 0)
+                    fprintf(f, "G1 Z%0.2f\n", float(currentPosition.z)/1000);
+                if (flavor == GCODE_FLAVOR_ULTIGCODE)
+                {
+                    fprintf(f, "G11\n");
+                }else{
+                    extrusionAmount += retractionAmountPrime;
+                    fprintf(f, "G1 F%i %c%0.5lf\n", retractionSpeed * 60, extruderCharacter[extruderNr], extrusionAmount);
+                    currentSpeed = retractionSpeed;
+                    estimateCalculator.plan(TimeEstimateCalculator::Position(INT2MM(p.X), INT2MM(p.Y), INT2MM(zPos), extrusionAmount), currentSpeed);
+                }
+                if (extrusionAmount > 10000.0) //According to https://github.com/Ultimaker/CuraEngine/issues/14 having more then 21m of extrusion causes inaccuracies. So reset it every 10m, just to be sure.
+                    resetExtrusionValue();
+                isRetracted = false;
+            }
+            extrusionAmount += extrusionPerMM * INT2MM(lineWidth) * vSizeMM(diff);
+            fprintf(f, "G1");
+        }else{
+            fprintf(f, "G0");
+        }
+
+        if (currentSpeed != speed)
+        {
+            fprintf(f, " F%i", speed * 60);
+            currentSpeed = speed;
+        }
+
+        fprintf(f, " X%0.2f Y%0.2f", INT2MM(p.X - extruderOffset[extruderNr].X), INT2MM(p.Y - extruderOffset[extruderNr].Y));
+        if (zPos != currentPosition.z)
+            fprintf(f, " Z%0.2f", INT2MM(zPos));
+        if (lineWidth != 0)
+            fprintf(f, " %c%0.5lf", extruderCharacter[extruderNr], extrusionAmount);
+        fprintf(f, "\n");
     }
-    
-    if (currentSpeed != speed)
-    {
-        fprintf(f, " F%i", speed * 60);
-        currentSpeed = speed;
-    }
-    fprintf(f, " X%0.2f Y%0.2f", float(p.X - extruderOffset[extruderNr].X)/1000, float(p.Y - extruderOffset[extruderNr].Y)/1000);
-    if (zPos != currentPosition.z)
-        fprintf(f, " Z%0.2f", float(zPos)/1000);
-    if (lineWidth != 0)
-        fprintf(f, " E%0.5lf", extrusionAmount);
-    fprintf(f, "\n");
     
     currentPosition = Point3(p.X, p.Y, zPos);
+    estimateCalculator.plan(TimeEstimateCalculator::Position(INT2MM(currentPosition.x), INT2MM(currentPosition.y), INT2MM(currentPosition.z), extrusionAmount), speed);
 }
 
-void GCodeExport::addRetraction()
+void GCodeExport::writeRetraction()
 {
+    if (flavor == GCODE_FLAVOR_BFB)//BitsFromBytes does automatic retraction.
+        return;
+    
     if (retractionAmount > 0 && !isRetracted && extrusionAmountAtPreviousRetraction + minimalExtrusionBeforeRetraction < extrusionAmount)
     {
         if (flavor == GCODE_FLAVOR_ULTIGCODE)
         {
             fprintf(f, "G10\n");
         }else{
-            fprintf(f, "G1 F%i E%0.5lf\n", retractionSpeed * 60, extrusionAmount - retractionAmount);
+            fprintf(f, "G1 F%i %c%0.5lf\n", retractionSpeed * 60, extruderCharacter[extruderNr], extrusionAmount - retractionAmount);
             currentSpeed = retractionSpeed;
+            estimateCalculator.plan(TimeEstimateCalculator::Position(INT2MM(currentPosition.x), INT2MM(currentPosition.y), INT2MM(currentPosition.z), extrusionAmount - retractionAmount), currentSpeed);
         }
+        if (retractionZHop > 0)
+            fprintf(f, "G1 Z%0.2f\n", INT2MM(currentPosition.z + retractionZHop));
         extrusionAmountAtPreviousRetraction = extrusionAmount;
         isRetracted = true;
     }
@@ -226,27 +301,38 @@ void GCodeExport::switchExtruder(int newExtruder)
 {
     if (extruderNr == newExtruder)
         return;
+    if (flavor == GCODE_FLAVOR_BFB)
+    {
+        if (!isRetracted)
+            fprintf(f, "M103\n");
+        isRetracted = true;
+        return;
+    }
     
-    resetExtrusionValue();
-    extruderNr = newExtruder;
-
     if (flavor == GCODE_FLAVOR_ULTIGCODE)
     {
         fprintf(f, "G10 S1\n");
     }else{
-        fprintf(f, "G1 F%i E%0.4lf\n", retractionSpeed * 60, extrusionAmount - extruderSwitchRetraction);
+        fprintf(f, "G1 F%i %c%0.5lf\n", retractionSpeed * 60, extruderCharacter[extruderNr], extrusionAmount - extruderSwitchRetraction);
         currentSpeed = retractionSpeed;
     }
+    resetExtrusionValue();
+    extruderNr = newExtruder;
+    if (flavor == GCODE_FLAVOR_MACH3)
+        resetExtrusionValue();
     isRetracted = true;
-    fprintf(f, "T%i\n", extruderNr);
+    if (flavor == GCODE_FLAVOR_MAKERBOT)
+        fprintf(f, "M135 T%i\n", extruderNr);
+    else
+        fprintf(f, "T%i\n", extruderNr);
 }
 
-void GCodeExport::addCode(const char* str)
+void GCodeExport::writeCode(const char* str)
 {
     fprintf(f, "%s\n", str);
 }
 
-void GCodeExport::addFanCommand(int speed)
+void GCodeExport::writeFanCommand(int speed)
 {
     if (currentFanSpeed == speed)
         return;
@@ -274,11 +360,34 @@ void GCodeExport::tellFileSize() {
     float fsize = (float) ftell(f);
     if(fsize > 1024*1024) {
         fsize /= 1024.0*1024.0;
-        fprintf(stderr, "Wrote %5.1f MB.\n",fsize);
+        log("Wrote %5.1f MB.\n",fsize);
     }
     if(fsize > 1024) {
         fsize /= 1024.0;
-        fprintf(stderr, "Wrote %5.1f kilobytes.\n",fsize);
+        log("Wrote %5.1f kilobytes.\n",fsize);
+    }
+}
+
+void GCodeExport::finalize(int maxObjectHeight, int moveSpeed, const char* endCode)
+{
+    writeFanCommand(0);
+    writeRetraction();
+    setZ(maxObjectHeight + 5000);
+    writeMove(getPositionXY(), moveSpeed, 0);
+    writeCode(endCode);
+    log("Print time: %d\n", int(getTotalPrintTime()));
+    log("Filament: %d\n", int(getTotalFilamentUsed(0)));
+    log("Filament2: %d\n", int(getTotalFilamentUsed(1)));
+    
+    if (getFlavor() == GCODE_FLAVOR_ULTIGCODE)
+    {
+        char numberString[16];
+        sprintf(numberString, "%d", int(getTotalPrintTime()));
+        replaceTagInStart("<__TIME__>", numberString);
+        sprintf(numberString, "%d", int(getTotalFilamentUsed(0)));
+        replaceTagInStart("<FILAMENT>", numberString);
+        sprintf(numberString, "%d", int(getTotalFilamentUsed(1)));
+        replaceTagInStart("<FILAMEN2>", numberString);
     }
 }
 
@@ -366,13 +475,16 @@ void GCodePlanner::moveInsideCombBoundary(int distance)
     {
         //Move inside again, so we move out of tight 90deg corners
         comb->moveInside(&p, distance);
-        addTravel(p);
-        //Make sure the that any retraction happens after this move, not before it by starting a new move path.
-        forceNewPathStart();
+        if (comb->checkInside(p))
+        {
+            addTravel(p);
+            //Make sure the that any retraction happens after this move, not before it by starting a new move path.
+            forceNewPathStart();
+        }
     }
 }
 
-void GCodePlanner::addPolygon(ClipperLib::Polygon& polygon, int startIdx, GCodePathConfig* config)
+void GCodePlanner::addPolygon(PolygonRef polygon, int startIdx, GCodePathConfig* config)
 {
     Point p0 = polygon[startIdx];
     addTravel(p0);
@@ -465,11 +577,11 @@ void GCodePlanner::writeGCode(bool liftHeadIfNeeded, int layerThickness)
             gcode.switchExtruder(extruder);
         }else if (path->retract)
         {
-            gcode.addRetraction();
+            gcode.writeRetraction();
         }
         if (path->config != &travelConfig && lastConfig != path->config)
         {
-            gcode.addComment("TYPE:%s", path->config->name);
+            gcode.writeComment("TYPE:%s", path->config->name);
             lastConfig = path->config;
         }
         int speed = path->config->speed;
@@ -500,17 +612,27 @@ void GCodePlanner::writeGCode(bool liftHeadIfNeeded, int layerThickness)
                     Point newPoint = (paths[x].points[0] + paths[x+1].points[0]) / 2;
                     int64_t newLen = vSize(gcode.getPositionXY() - newPoint);
                     if (newLen > 0)
-                        gcode.addMove(newPoint, speed, path->config->lineWidth * oldLen / newLen);
+                        gcode.writeMove(newPoint, speed, path->config->lineWidth * oldLen / newLen);
                     
                     p0 = paths[x+1].points[0];
                 }
-                gcode.addMove(paths[i-1].points[0], speed, path->config->lineWidth);
+                gcode.writeMove(paths[i-1].points[0], speed, path->config->lineWidth);
                 n = i - 1;
                 continue;
             }
         }
         
-        if (path->config->spiralize)
+        bool spiralize = path->config->spiralize;
+        if (spiralize)
+        {
+            //Check if we are the last spiralize path in the list, if not, do not spiralize.
+            for(unsigned int m=n+1; m<paths.size(); m++)
+            {
+                if (paths[m].config->spiralize)
+                    spiralize = false;
+            }
+        }
+        if (spiralize)
         {
             //If we need to spiralize then raise the head slowly by 1 layer as this path progresses.
             float totalLength = 0.0;
@@ -531,27 +653,24 @@ void GCodePlanner::writeGCode(bool liftHeadIfNeeded, int layerThickness)
                 length += vSizeMM(p0 - p1);
                 p0 = p1;
                 gcode.setZ(z + layerThickness * length / totalLength);
-                gcode.addMove(path->points[i], speed, path->config->lineWidth);
+                gcode.writeMove(path->points[i], speed, path->config->lineWidth);
             }
         }else{
             for(unsigned int i=0; i<path->points.size(); i++)
             {
-                gcode.addMove(path->points[i], speed, path->config->lineWidth);
+                gcode.writeMove(path->points[i], speed, path->config->lineWidth);
             }
         }
     }
     
-    gcode.totalPrintTime += this->totalPrintTime;
+    gcode.updateTotalPrintTime();
     if (liftHeadIfNeeded && extraTime > 0.0)
     {
-        gcode.totalPrintTime += extraTime;
-        
-        gcode.addComment("Small layer, adding delay of %f", extraTime);
-        gcode.addRetraction();
-        gcode.setZ(gcode.getPositionZ() + 3000);
-        gcode.addMove(gcode.getPositionXY(), travelConfig.speed, 0);
-        gcode.addMove(gcode.getPositionXY() - Point(-20000, 0), travelConfig.speed, 0);
-        gcode.addDelay(extraTime);
+        gcode.writeComment("Small layer, adding delay of %f", extraTime);
+        gcode.writeRetraction();
+        gcode.setZ(gcode.getPositionZ() + MM2INT(3.0));
+        gcode.writeMove(gcode.getPositionXY(), travelConfig.speed, 0);
+        gcode.writeMove(gcode.getPositionXY() - Point(-MM2INT(20.0), 0), travelConfig.speed, 0);
+        gcode.writeDelay(extraTime);
     }
 }
-
