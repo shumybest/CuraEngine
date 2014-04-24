@@ -55,11 +55,11 @@ else
 		CFLAGS += -force_cpusubtype_ALL -mmacosx-version-min=10.6 -arch x86_64 -arch i386
 		LDFLAGS += -force_cpusubtype_ALL -mmacosx-version-min=10.6 -arch x86_64 -arch i386
 	endif
-endif
-ifeq ($(UNAME), CYGWIN_NT-5.1)
+	ifeq ($(UNAME), CYGWIN_NT-6.1)
 	#For windows make it large address aware, which allows the process to use more then 2GB of memory.
 	CFLAGS += -march=pentium4
 	LDFLAGS += -Wl,--large-address-aware -lm --static
+	endif
 endif
 
 all: $(DIRS) $(SOURCES) $(EXECUTABLE)
