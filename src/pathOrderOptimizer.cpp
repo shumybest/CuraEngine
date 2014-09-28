@@ -33,8 +33,10 @@ void PathOrderOptimizer::optimize()
         
         if (poly.size() == 2)
         {
-            location_to_polygon_map[hashPoint(poly[0])].push_back(i);
-            location_to_polygon_map[hashPoint(poly[1])].push_back(i);
+            Point p0 = poly[0];
+	     Point p1 = poly[1];
+            location_to_polygon_map[hashPoint(p0)].push_back(i);
+            location_to_polygon_map[hashPoint(p1)].push_back(i);
         }
     }
 
